@@ -191,11 +191,15 @@ class NuGraph2_model(nn.Module):
     Simple AddSub network in PyTorch. This network outpxuts the sum and
     subtraction of the inputs.
     """
-
-    def __init__(self):
+    def __init__(self, device_num=None):
         super(NuGraph2_model, self).__init__()
         self.MODEL = ng.models.nugraph2.NuGraph2
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if device_num is not None:
+            self.device = torch.device('cuda', device_num)
+        elif torch.cuda.is_available():
+            self.device = torch.device('cuda:0')
+        else:
+            self.device = torch.device('cpu')
         modelpath = os.path.dirname(os.path.abspath(__file__))
         self.model = self.MODEL.load_from_checkpoint(os.path.join(modelpath, "test-ng2.ckpt"), map_location=self.device)
         self.planes = ['u', 'v', 'y']
@@ -252,6 +256,7 @@ class TritonPythonModel:
 
         # You must parse model_config. JSON string is not parsed here
         self.model_config = model_config = json.loads(args["model_config"])
+        self.model_instance_device_id = json.loads(args["model_instance_device_id"])
 
         # Get ouptput configuration
         x_semantic_u_config = pb_utils.get_output_config_by_name(model_config, "x_semantic_u")
@@ -281,7 +286,7 @@ class TritonPythonModel:
             x_filter_y_config["data_type"]
         )
         # Instantiate the PyTorch model
-        self.NuGraph2_model = NuGraph2_model()
+        self.NuGraph2_model = NuGraph2_model(device_num=self.model_instance_device_id)
 
     def execute(self, requests):
         """`execute` must be implemented in every Python model. `execute`

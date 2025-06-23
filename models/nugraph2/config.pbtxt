@@ -26,6 +26,13 @@
 
 name: "nugraph2"
 backend: "python"
+instance_group [
+    {
+      count: 8
+      kind: KIND_GPU
+      gpus: [ 0, 1, 2, 3 ]
+    }
+]
 input [
   {
     name: "hit_table_hit_id"

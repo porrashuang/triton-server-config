@@ -16,6 +16,32 @@ from torch_geometric.data import Dataset
 # and converting Triton input/output types to numpy types.
 import triton_python_backend_utils as pb_utils
 
+
+# OpenTelemetry Dependencies
+from opentelemetry import trace
+from opentelemetry.trace import (
+    SpanKind,
+    SpanContext,
+)
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import (
+        BatchSpanProcessor,
+        ConsoleSpanExporter
+)
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from opentelemetry.sdk.resources import Resource
+# metrics
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.propagate import extract
+
+# setup
+resource = Resource.create(attributes={"service.name": "nugraph"})
+provider = TracerProvider(resource=resource)
+processor = BatchSpanProcessor(OTLPSpanExporter(endpoint="http://jaeger-loadbalancer.iias-metrics.development.svc.spin.nersc.org:3306/v1/traces"))
+provider.add_span_processor(processor)
+trace.set_tracer_provider(provider)
+tracer = trace.get_tracer("my.test.tracer")
+
 class HitGraphProducer():
     def __init__(self,
                  semantic_labeller: Callable = None,
@@ -213,24 +239,26 @@ class NuGraph2_model(nn.Module):
                     hit_table_local_wire, hit_table_integral, hit_table_rms, \
                     spacepoint_table_spacepoint_id, spacepoint_table_hit_id_u, spacepoint_table_hit_id_v, \
                     spacepoint_table_hit_id_y):
+        with tracer.start_as_current_span("create_graph"):
         
-        gnn_hetero_data = self.hitgraph.create_graph(hit_table_hit_id, hit_table_local_plane, hit_table_local_time, \
-                                                    hit_table_local_wire, hit_table_integral, hit_table_rms, \
-                                                    spacepoint_table_spacepoint_id, spacepoint_table_hit_id_u, spacepoint_table_hit_id_v, \
-                                                    spacepoint_table_hit_id_y)
+            gnn_hetero_data = self.hitgraph.create_graph(hit_table_hit_id, hit_table_local_plane, hit_table_local_time, \
+                                                        hit_table_local_wire, hit_table_integral, hit_table_rms, \
+                                                        spacepoint_table_spacepoint_id, spacepoint_table_hit_id_u, spacepoint_table_hit_id_v, \
+                                                        spacepoint_table_hit_id_y)
 
-        transform = Compose((ng.util.PositionFeatures(self.planes),
-                             ng.util.FeatureNorm(self.planes, self.norm),
-                             ng.util.HierarchicalEdges(self.planes),
-                             ng.util.EventLabels()))
-        hetero_dataset = HeteroDataset(gnn_hetero_data, transform=transform)
+            transform = Compose((ng.util.PositionFeatures(self.planes),
+                                ng.util.FeatureNorm(self.planes, self.norm),
+                                ng.util.HierarchicalEdges(self.planes),
+                                ng.util.EventLabels()))
+            hetero_dataset = HeteroDataset(gnn_hetero_data, transform=transform)
         data = hetero_dataset.get()
-        self.model.step(data.to(self.device))
-        x = self.model.data
-        return  x['u']['x_semantic'].cpu().detach().numpy(), \
-                x['v']['x_semantic'].cpu().detach().numpy(), x['y']['x_semantic'].cpu().detach().numpy(), \
-                x['u']['x_filter'].cpu().detach().numpy(), x['v']['x_filter'].cpu().detach().numpy(), \
-                x['y']['x_filter'].cpu().detach().numpy()
+        with tracer.start_as_current_span("model_inference"):
+            self.model.step(data.to(self.device))
+            x = self.model.data
+            return  x['u']['x_semantic'].cpu().detach().numpy(), \
+                    x['v']['x_semantic'].cpu().detach().numpy(), x['y']['x_semantic'].cpu().detach().numpy(), \
+                    x['u']['x_filter'].cpu().detach().numpy(), x['v']['x_filter'].cpu().detach().numpy(), \
+                    x['y']['x_filter'].cpu().detach().numpy()
 
 class TritonPythonModel:
     """Your Python model must use the same class name. Every Python model
@@ -309,7 +337,6 @@ class TritonPythonModel:
           A list of pb_utils.InferenceResponse. The length of this list must
           be the same as `requests`
         """
-
         x_semantic_u_dtype = self.x_semantic_u_dtype
         x_semantic_v_dtype = self.x_semantic_v_dtype
         x_semantic_y_dtype = self.x_semantic_y_dtype
@@ -319,44 +346,48 @@ class TritonPythonModel:
 
 
         responses = []
-
         # Every Python backend must iterate over everyone of the requests
         # and create a pb_utils.InferenceResponse for each of them.
         for request in requests:
-            # Get all inputs
-            hit_table_hit_id = pb_utils.get_input_tensor_by_name(request, "hit_table_hit_id")
-            hit_table_local_plane = pb_utils.get_input_tensor_by_name(request, "hit_table_local_plane")
-            hit_table_local_time = pb_utils.get_input_tensor_by_name(request, "hit_table_local_time")
-            hit_table_local_wire = pb_utils.get_input_tensor_by_name(request, "hit_table_local_wire")
-            hit_table_integral = pb_utils.get_input_tensor_by_name(request, "hit_table_integral")
-            hit_table_rms = pb_utils.get_input_tensor_by_name(request, "hit_table_rms")
+            # This will create a root span in the specified trace
+            carrier = json.loads(request.trace().get_context())
+            ctx = extract(carrier)  # Extract OpenTelemetry context from request
+            with tracer.start_as_current_span("full_request_processing", kind=SpanKind.SERVER, context=ctx) as span:
 
-            spacepoint_table_spacepoint_id = pb_utils.get_input_tensor_by_name(request, "spacepoint_table_spacepoint_id")
-            spacepoint_table_hit_id_u = pb_utils.get_input_tensor_by_name(request, "spacepoint_table_hit_id_u")
-            spacepoint_table_hit_id_v = pb_utils.get_input_tensor_by_name(request, "spacepoint_table_hit_id_v")
-            spacepoint_table_hit_id_y = pb_utils.get_input_tensor_by_name(request, "spacepoint_table_hit_id_y")
+                with tracer.start_as_current_span("input_processing"):
+                    hit_table_hit_id = pb_utils.get_input_tensor_by_name(request, "hit_table_hit_id")
+                    hit_table_local_plane = pb_utils.get_input_tensor_by_name(request, "hit_table_local_plane")
+                    hit_table_local_time = pb_utils.get_input_tensor_by_name(request, "hit_table_local_time")
+                    hit_table_local_wire = pb_utils.get_input_tensor_by_name(request, "hit_table_local_wire")
+                    hit_table_integral = pb_utils.get_input_tensor_by_name(request, "hit_table_integral")
+                    hit_table_rms = pb_utils.get_input_tensor_by_name(request, "hit_table_rms")
+
+                    spacepoint_table_spacepoint_id = pb_utils.get_input_tensor_by_name(request, "spacepoint_table_spacepoint_id")
+                    spacepoint_table_hit_id_u = pb_utils.get_input_tensor_by_name(request, "spacepoint_table_hit_id_u")
+                    spacepoint_table_hit_id_v = pb_utils.get_input_tensor_by_name(request, "spacepoint_table_hit_id_v")
+                    spacepoint_table_hit_id_y = pb_utils.get_input_tensor_by_name(request, "spacepoint_table_hit_id_y")
+                with tracer.start_as_current_span("nugraph_execution"):
+                    output1, output2, output3, output4, output5, output6 = \
+                        self.NuGraph2_model(hit_table_hit_id.as_numpy(), hit_table_local_plane.as_numpy(), \
+                                            hit_table_local_time.as_numpy(), \
+                                            hit_table_local_wire.as_numpy(), hit_table_integral.as_numpy(), hit_table_rms.as_numpy(), \
+                        spacepoint_table_spacepoint_id.as_numpy(), spacepoint_table_hit_id_u.as_numpy(), spacepoint_table_hit_id_v.as_numpy(), \
+                        spacepoint_table_hit_id_y.as_numpy())
             
-            output1, output2, output3, output4, output5, output6 = \
-                                        self.NuGraph2_model(hit_table_hit_id.as_numpy(), hit_table_local_plane.as_numpy(), \
-                                                    hit_table_local_time.as_numpy(), \
-                    hit_table_local_wire.as_numpy(), hit_table_integral.as_numpy(), hit_table_rms.as_numpy(), \
-                    spacepoint_table_spacepoint_id.as_numpy(), spacepoint_table_hit_id_u.as_numpy(), spacepoint_table_hit_id_v.as_numpy(), \
-                    spacepoint_table_hit_id_y.as_numpy())
-        
+                # Create output tensors. You need pb_utils.Tensor
+                # objects to create pb_utils.InferenceResponse.
+                with tracer.start_as_current_span("output_processing"):
+                    out_tensor_1 = pb_utils.Tensor("x_semantic_u", output1.astype(x_semantic_u_dtype))
+                    out_tensor_2 = pb_utils.Tensor("x_semantic_v", output2.astype(x_semantic_v_dtype))
+                    out_tensor_3 = pb_utils.Tensor("x_semantic_y", output3.astype(x_semantic_y_dtype))
+                    out_tensor_4 = pb_utils.Tensor("x_filter_u", output4.astype(x_filter_u_dtype))
+                    out_tensor_5 = pb_utils.Tensor("x_filter_v", output5.astype(x_filter_v_dtype))
+                    out_tensor_6 = pb_utils.Tensor("x_filter_y", output6.astype(x_filter_y_dtype))
 
-            # Create output tensors. You need pb_utils.Tensor
-            # objects to create pb_utils.InferenceResponse.
-            out_tensor_1 = pb_utils.Tensor("x_semantic_u", output1.astype(x_semantic_u_dtype))
-            out_tensor_2 = pb_utils.Tensor("x_semantic_v", output2.astype(x_semantic_v_dtype))
-            out_tensor_3 = pb_utils.Tensor("x_semantic_y", output3.astype(x_semantic_y_dtype))
-            out_tensor_4 = pb_utils.Tensor("x_filter_u", output4.astype(x_filter_u_dtype))
-            out_tensor_5 = pb_utils.Tensor("x_filter_v", output5.astype(x_filter_v_dtype))
-            out_tensor_6 = pb_utils.Tensor("x_filter_y", output6.astype(x_filter_y_dtype))
-
-            inference_response = pb_utils.InferenceResponse(
-                output_tensors=[out_tensor_1, out_tensor_2, out_tensor_3, out_tensor_4, out_tensor_5, out_tensor_6]
-            )
-            responses.append(inference_response)
+                    inference_response = pb_utils.InferenceResponse(
+                        output_tensors=[out_tensor_1, out_tensor_2, out_tensor_3, out_tensor_4, out_tensor_5, out_tensor_6]
+                    )
+                    responses.append(inference_response)
 
         # You should return a list of pb_utils.InferenceResponse. Length
         # of this list must match the length of `requests` list.

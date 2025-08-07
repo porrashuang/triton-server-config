@@ -28,7 +28,6 @@ from opentelemetry.sdk.trace.export import (
         BatchSpanProcessor,
         ConsoleSpanExporter
 )
-from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 from opentelemetry.sdk.resources import Resource
 # metrics
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -72,133 +71,135 @@ class HitGraphProducer():
                     hit_table_local_wire, hit_table_integral, hit_table_rms, \
                     spacepoint_table_spacepoint_id, spacepoint_table_hit_id_u, spacepoint_table_hit_id_v, \
                     spacepoint_table_hit_id_y):
-        evt = {
-            'hit_table': pd.DataFrame({
-                'hit_id':hit_table_hit_id, 'local_plane': hit_table_local_plane, 'local_time':hit_table_local_time, \
-                'local_wire':hit_table_local_wire, 'integral':hit_table_integral, 'rms':hit_table_rms
-            }),
-            'spacepoint_table': pd.DataFrame({
-                'spacepoint_id':spacepoint_table_spacepoint_id, 'hit_id_u':spacepoint_table_hit_id_u, \
-                'hit_id_v':spacepoint_table_hit_id_v, 'hit_id_y':spacepoint_table_hit_id_y
-            })
-                                
-        }
-        if self.event_labeller or self.label_vertex:
-            event = evt['event_table'].squeeze()
+        with tracer.start_as_current_span("create_graph_dataframe"):
+            evt = {
+                'hit_table': pd.DataFrame({
+                    'hit_id':hit_table_hit_id, 'local_plane': hit_table_local_plane, 'local_time':hit_table_local_time, \
+                    'local_wire':hit_table_local_wire, 'integral':hit_table_integral, 'rms':hit_table_rms
+                }),
+                'spacepoint_table': pd.DataFrame({
+                    'spacepoint_id':spacepoint_table_spacepoint_id, 'hit_id_u':spacepoint_table_hit_id_u, \
+                    'hit_id_v':spacepoint_table_hit_id_v, 'hit_id_y':spacepoint_table_hit_id_y
+                })
+                                    
+            }
+            if self.event_labeller or self.label_vertex:
+                event = evt['event_table'].squeeze()
 
-        hits = evt['hit_table']
-        spacepoints = evt['spacepoint_table'].reset_index(drop=True)
+            hits = evt['hit_table']
+            spacepoints = evt['spacepoint_table'].reset_index(drop=True)
 
-        # discard any events with pathologically large hit integrals
-        # this is a hotfix that should be removed once the dataset is fixed
-        if hits.integral.max() > 1e6:
-            print('found event with pathologically large hit integral, skipping')
-            return evt.name, None
-
-        # handle energy depositions
-        if self.filter_hits or self.semantic_labeller:
-            edeps = evt['edep_table']
-            energy_col = 'energy' if 'energy' in edeps.columns else 'energy_fraction' # for backwards compatibility
-            edeps = edeps.sort_values(by=[energy_col],
-                                      ascending=False,
-                                      kind='mergesort').drop_duplicates('hit_id')
-            hits = edeps.merge(hits, on='hit_id', how='right')
-
-            # if we're filtering out data hits, do that
-            if self.filter_hits:
-                hitmask = hits[energy_col].isnull()
-                filtered_hits = hits[hitmask].hit_id.tolist()
-                hits = hits[~hitmask].reset_index(drop=True)
-                # filter spacepoints from noise
-                cols = [ f'hit_id_{p}' for p in self.planes ]
-                spmask = spacepoints[cols].isin(filtered_hits).any(axis='columns')
-                spacepoints = spacepoints[~spmask].reset_index(drop=True)
-
-            hits['filter_label'] = ~hits[energy_col].isnull()
-            hits = hits.drop(energy_col, axis='columns')
-
-        # reset spacepoint index
-        spacepoints = spacepoints.reset_index(names='index_3d')
-
-        # get labels for each particle
-        if self.semantic_labeller:
-            particles = self.semantic_labeller(evt['particle_table'])
-            try:
-                hits = hits.merge(particles, on='g4_id', how='left')
-            except:
-                print('exception occurred when merging hits and particles')
-                print('hit table:', hits)
-                print('particle table:', particles)
-                print('skipping this event')
-                return None
-            mask = (~hits.g4_id.isnull()) & (hits.semantic_label.isnull())
-            if mask.any():
-                print(f'found {mask.sum()} orphaned hits.')
+            # discard any events with pathologically large hit integrals
+            # this is a hotfix that should be removed once the dataset is fixed
+            if hits.integral.max() > 1e6:
+                print('found event with pathologically large hit integral, skipping')
                 return evt.name, None
-            del mask
 
-        data = pyg.data.HeteroData()
+            # handle energy depositions
+            if self.filter_hits or self.semantic_labeller:
+                edeps = evt['edep_table']
+                energy_col = 'energy' if 'energy' in edeps.columns else 'energy_fraction' # for backwards compatibility
+                edeps = edeps.sort_values(by=[energy_col],
+                                        ascending=False,
+                                        kind='mergesort').drop_duplicates('hit_id')
+                hits = edeps.merge(hits, on='hit_id', how='right')
 
-        # event metadata
-        data['metadata'].run = 6876
-        data['metadata'].subrun = 9
-        data['metadata'].event = 470
+                # if we're filtering out data hits, do that
+                if self.filter_hits:
+                    hitmask = hits[energy_col].isnull()
+                    filtered_hits = hits[hitmask].hit_id.tolist()
+                    hits = hits[~hitmask].reset_index(drop=True)
+                    # filter spacepoints from noise
+                    cols = [ f'hit_id_{p}' for p in self.planes ]
+                    spmask = spacepoints[cols].isin(filtered_hits).any(axis='columns')
+                    spacepoints = spacepoints[~spmask].reset_index(drop=True)
 
-        # spacepoint nodes
-        data['sp'].num_nodes = spacepoints.shape[0]
+                hits['filter_label'] = ~hits[energy_col].isnull()
+                hits = hits.drop(energy_col, axis='columns')
 
-        # draw graph edges
-        for i, plane_hits in hits.groupby('local_plane'):
+            # reset spacepoint index
+            spacepoints = spacepoints.reset_index(names='index_3d')
 
-            p = self.planes[i]
-            plane_hits = plane_hits.reset_index(drop=True).reset_index(names='index_2d')
-
-            # node position
-            pos = torch.tensor(plane_hits[self.node_pos].values).float()
-            data[p].pos = pos * self.pos_norm[None,:]
-
-            # node features
-            data[p].x = torch.tensor(plane_hits[self.node_feats].values).float()
-
-            # hit indices
-            data[p].id = torch.tensor(plane_hits['hit_id'].values).long()
-
-            # 2D edges
-            data[p, 'plane', p].edge_index = self.transform(data[p]).edge_index
-
-            # 3D edges
-            edge3d = spacepoints.merge(plane_hits[['hit_id','index_2d']].add_suffix(f'_{p}'),
-                                       on=f'hit_id_{p}',
-                                       how='inner')
-            edge3d = edge3d[[f'index_2d_{p}','index_3d']].values.transpose()
-            edge3d = torch.tensor(edge3d) if edge3d.size else torch.empty((2,0))
-            data[p, 'nexus', 'sp'].edge_index = edge3d.long()
-
-            # truth information
+            # get labels for each particle
             if self.semantic_labeller:
-                data[p].y_semantic = torch.tensor(plane_hits['semantic_label'].fillna(-1).values).long()
-                data[p].y_instance = torch.tensor(plane_hits['instance_label'].fillna(-1).values).long()
+                particles = self.semantic_labeller(evt['particle_table'])
+                try:
+                    hits = hits.merge(particles, on='g4_id', how='left')
+                except:
+                    print('exception occurred when merging hits and particles')
+                    print('hit table:', hits)
+                    print('particle table:', particles)
+                    print('skipping this event')
+                    return None
+                mask = (~hits.g4_id.isnull()) & (hits.semantic_label.isnull())
+                if mask.any():
+                    print(f'found {mask.sum()} orphaned hits.')
+                    return evt.name, None
+                del mask
+
+            data = pyg.data.HeteroData()
+
+            # event metadata
+            data['metadata'].run = 6876
+            data['metadata'].subrun = 9
+            data['metadata'].event = 470
+
+            # spacepoint nodes
+            data['sp'].num_nodes = spacepoints.shape[0]
+            
+        with tracer.start_as_current_span("create_graph_edges"):
+            # draw graph edges
+            for i, plane_hits in hits.groupby('local_plane'):
+
+                p = self.planes[i]
+                plane_hits = plane_hits.reset_index(drop=True).reset_index(names='index_2d')
+
+                # node position
+                pos = torch.tensor(plane_hits[self.node_pos].values).float()
+                data[p].pos = pos * self.pos_norm[None,:]
+
+                # node features
+                data[p].x = torch.tensor(plane_hits[self.node_feats].values).float()
+
+                # hit indices
+                data[p].id = torch.tensor(plane_hits['hit_id'].values).long()
+
+                # 2D edges
+                data[p, 'plane', p].edge_index = self.transform(data[p]).edge_index
+
+                # 3D edges
+                edge3d = spacepoints.merge(plane_hits[['hit_id','index_2d']].add_suffix(f'_{p}'),
+                                        on=f'hit_id_{p}',
+                                        how='inner')
+                edge3d = edge3d[[f'index_2d_{p}','index_3d']].values.transpose()
+                edge3d = torch.tensor(edge3d) if edge3d.size else torch.empty((2,0))
+                data[p, 'nexus', 'sp'].edge_index = edge3d.long()
+
+                # truth information
+                if self.semantic_labeller:
+                    data[p].y_semantic = torch.tensor(plane_hits['semantic_label'].fillna(-1).values).long()
+                    data[p].y_instance = torch.tensor(plane_hits['instance_label'].fillna(-1).values).long()
+                if self.label_vertex:
+                    vtx_2d = torch.tensor([ event[f'nu_vtx_wire_pos_{i}'], event.nu_vtx_wire_time ]).float()
+                    data[p].y_vtx = vtx_2d * self.pos_norm[None,:]
+        with tracer.start_as_current_span("create_graph_spacepoints"):
+            for p in self.planes:
+                if bool(data[p]): continue
+                data[p].pos = torch.empty(0, 2)
+                data[p].x = torch.empty(0, 2)
+                data[p].id = torch.empty(0)
+                data[p, 'plane', p].edge_index = torch.empty((2, 0), dtype=torch.long)
+                data[p, 'nexus', 'sp'].edge_index = torch.empty((2, 0), dtype=torch.long)
+
+            # event label
+            if self.event_labeller:
+                data['evt'].y = torch.tensor(self.event_labeller(event)).long()
+
+            # 3D vertex truth
             if self.label_vertex:
-                vtx_2d = torch.tensor([ event[f'nu_vtx_wire_pos_{i}'], event.nu_vtx_wire_time ]).float()
-                data[p].y_vtx = vtx_2d * self.pos_norm[None,:]
-
-        for p in self.planes:
-            if bool(data[p]): continue
-            data[p].pos = torch.empty(0, 2)
-            data[p].x = torch.empty(0, 2)
-            data[p].id = torch.empty(0)
-            data[p, 'plane', p].edge_index = torch.empty((2, 0), dtype=torch.long)
-            data[p, 'nexus', 'sp'].edge_index = torch.empty((2, 0), dtype=torch.long)
-
-        # event label
-        if self.event_labeller:
-            data['evt'].y = torch.tensor(self.event_labeller(event)).long()
-
-        # 3D vertex truth
-        if self.label_vertex:
-            vtx_3d = [ [ event.nu_vtx_corr_x, event.nu_vtx_corr_y, event.nu_vtx_corr_z ] ]
-            data['evt'].y_vtx = torch.tensor(vtx_3d).float()
-        
+                vtx_3d = [ [ event.nu_vtx_corr_x, event.nu_vtx_corr_y, event.nu_vtx_corr_z ] ]
+                data['evt'].y_vtx = torch.tensor(vtx_3d).float()
+            
         return data
     
 class HeteroDataset(Dataset):
@@ -245,13 +246,15 @@ class NuGraph2_model(nn.Module):
                                                         hit_table_local_wire, hit_table_integral, hit_table_rms, \
                                                         spacepoint_table_spacepoint_id, spacepoint_table_hit_id_u, spacepoint_table_hit_id_v, \
                                                         spacepoint_table_hit_id_y)
-
-            transform = Compose((ng.util.PositionFeatures(self.planes),
-                                ng.util.FeatureNorm(self.planes, self.norm),
-                                ng.util.HierarchicalEdges(self.planes),
-                                ng.util.EventLabels()))
-            hetero_dataset = HeteroDataset(gnn_hetero_data, transform=transform)
-        data = hetero_dataset.get()
+        with tracer.start_as_current_span("transform_data"):
+            with tracer.start_as_current_span("transform_data_compose"):
+                transform = Compose((ng.util.PositionFeatures(self.planes),
+                                    ng.util.FeatureNorm(self.planes, self.norm),
+                                    ng.util.HierarchicalEdges(self.planes),
+                                    ng.util.EventLabels()))
+                hetero_dataset = HeteroDataset(gnn_hetero_data, transform=transform)
+            with tracer.start_as_current_span("transform_data_apply"):
+                data = hetero_dataset.get()
         with tracer.start_as_current_span("model_inference"):
             self.model.step(data.to(self.device))
             x = self.model.data
@@ -316,7 +319,7 @@ class TritonPythonModel:
         # Instantiate the PyTorch model
         self.NuGraph2_model = NuGraph2_model(device_num=self.model_instance_device_id)
 
-    def execute(self, requests):
+    async def execute(self, requests):
         """`execute` must be implemented in every Python model. `execute`
         function receives a list of pb_utils.InferenceRequest as the only
         argument. This function is called when an inference is requested
